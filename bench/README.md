@@ -1,11 +1,11 @@
 # bench
 
-SWE owns this directory.
+`llmhost-bench` measures prefill and decode tok/s and time to first token
+(p50/p95 over repeated runs), and records system load and pinned cores with
+each result. A llama.cpp baseline can be run in the same session for
+comparison. Numbers taken on a loaded machine are not reported as results.
 
-The `llmhost-bench` harness (prefill vs decode tok/s, TTFT, p50/p95, load
-and pinned-core recording, llama.cpp comparison in the same run) lives
-here. Official 40 tok/s figures need a quiet window on the development box.
-
-Report format for later GPU and multi-stream runs is in
-[`../ROADMAP.md`](../ROADMAP.md): single-stream vs total, 1/4/8 lanes,
-code vs prose, speculative decoding on/off with accept rate.
+Multi-stream and GPU runs use the report format in
+[`../ROADMAP.md`](../ROADMAP.md): single-stream and total throughput, 1/4/8
+lanes, code and prose prompts, and speculative decoding on and off with its
+accept rate.
