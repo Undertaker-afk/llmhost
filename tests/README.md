@@ -19,3 +19,7 @@ versions, prompts, and the sha256 of every file. Regenerate them with:
 ```
 python tools/ref_dump.py --model LiquidAI/LFM2-700M --out tests/golden/lfm2-700m
 ```
+
+The reference dumps are produced with Liquid AI's LFM models, which are
+licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2-700M/blob/main/LICENSE).
+The model weights and the dumps are not distributed with this repository.
