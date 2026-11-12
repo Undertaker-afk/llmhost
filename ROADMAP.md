@@ -3,8 +3,7 @@
 ## Phase: CPU first
 
 The hard requirement is **40 tok/s** decode at batch size 1 with Q4 weights,
-measured on the development box (8 Xeon vCPUs, AVX-512 VNNI / AMX, 15 GB
-RAM, no GPU).
+measured on the reference machine: 8 Xeon vCPUs with AVX-512/AMX.
 
 That bar applies to:
 
@@ -12,8 +11,8 @@ That bar applies to:
 - LFM3-1.7B
 - LFM3-VL-2B
 
-LFM2-2.6B is **best effort** on this box: the bandwidth ceiling for Q4 at
-~1.2+ GB/token is tight, and 40 tok/s may not hold.
+LFM2-2.6B is **best effort** on the reference machine: the bandwidth ceiling
+for Q4 at ~1.2+ GB/token is tight, and 40 tok/s may not hold.
 
 Work order follows the milestones in [ARCHITECTURE.md](ARCHITECTURE.md):
 fp32 correctness (M1), then Q4/Q8 SIMD and the bench harness (M2), then the
@@ -21,9 +20,9 @@ HTTP APIs (M3). Vision (M5) is required for LFM3-VL-2B to count. Official
 TPS numbers are taken only in a quiet window, with load recorded, and are
 compared to llama.cpp only in the same run.
 
-A second CPU target is Flo's Hetzner server 2 (AX41, Zen 2, AVX2 only).
-It is not the 40 tok/s gate. Binaries shipped there are built for
-x86-64-v3, not `-C target-cpu=native`.
+A second CPU target is an x86-64-v3 Zen 2 host (AVX2 only). It is not the
+40 tok/s gate. Binaries for that class of machine are built for x86-64-v3,
+not `-C target-cpu=native`.
 
 ## Long-term: GPU
 
@@ -38,12 +37,13 @@ The path there is:
 - NVFP4 weights
 
 This work sits after the CPU phase (M4 wgpu first for a portable GPU path,
-then M6 CUDA / Metal). It is not benchmarked on the development box.
+then M6 CUDA / Metal). It is not benchmarked on the CPU-only reference
+machine.
 
 ## Bench reports
 
-SWE owns `bench/`. When GPU (and the later CPU) numbers are reported, each
-result should include:
+When GPU (and the later CPU) numbers are reported, each result should
+include:
 
 - single-stream tok/s vs total tok/s across streams
 - lane counts of 1, 4, and 8

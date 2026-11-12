@@ -36,9 +36,9 @@ Layer lists come from the config as follows:
 
 ## CPU first
 
-The 40 tok/s target is measured on the development box (8 Xeon vCPUs with
-AVX-512 VNNI / AMX, 15 GB RAM, no GPU). Decode is memory-bandwidth bound, so
-the kernels exist to cut bytes per token:
+The 40 tok/s target is measured on the reference machine: 8 Xeon vCPUs with
+AVX-512/AMX. Decode is memory-bandwidth bound, so the kernels exist to cut
+bytes per token:
 
 - **Decode:** AVX-512 VNNI GEMV of Q4 weights (32-element blocks, f16
   scales) with activations quantized to int8.
@@ -46,12 +46,13 @@ the kernels exist to cut bytes per token:
 - **Fallback:** AVX2 kernels, chosen at runtime together with the paths
   above. A scalar f32 reference stays around for correctness tests.
 - **Builds** stay on an x86-64-v3 baseline. There is no
-  `-C target-cpu=native` flag, so the same artifact can run on this box and
-  on a Zen 2 host (Hetzner AX41) that has AVX2 only. Kernel selection is
-  always at runtime.
+  `-C target-cpu=native` flag, so the same artifact can run on the
+  reference machine and on an x86-64-v3 Zen 2 host (AVX2 only). Kernel
+  selection is always at runtime.
 
-A wgpu GPU backend remains in scope for later milestones, but it cannot be
-benchmarked here (lavapipe can only check correctness).
+A wgpu GPU backend remains in scope for later milestones. On machines
+without a GPU, software Vulkan (lavapipe) can be used to check
+correctness, not speed.
 
 ## Formats
 
@@ -96,7 +97,8 @@ returns draft tokens and a tree for later tree-verification decode.
 - `llm-gpu-wgpu` — default GPU path (Vulkan / Metal / DX12 via WGSL).
 - `llm-cuda` / `llm-metal` — native fast paths, added later behind features.
 
-`tests/` and `bench/` are owned by SWE. Official 40 tok/s numbers need a quiet
+Correctness tests live in `tests/` and the bench harness in `bench/`; both
+are maintained by the maintainers. Official 40 tok/s numbers need a quiet
 machine; the harness records load and pinned cores.
 
 ## Milestones
@@ -106,7 +108,7 @@ Each milestone has a test gate.
 | | Goal | Gate |
 | --- | --- | --- |
 | **M1** | Run 700M on the CPU in fp32 | vs Hugging Face logits, 1e-3 overall, 1e-4 per layer |
-| **M2** | Q8 and Q4 on the CPU with SIMD | SWE bench harness, decode tok/s |
+| **M2** | Q8 and Q4 on the CPU with SIMD | the bench harness, decode tok/s |
 | **M3** | Engine plus server | OpenAI and Anthropic routes with streaming, official SDK tests |
 | **M4** | wgpu backend | logits match the CPU path |
 | **M5** | LFM2-VL / LFM3-VL | vision encoder, projector, image inputs in both APIs |
