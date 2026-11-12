@@ -1,0 +1,2 @@
+# Golden .npz dumps are large (100+ MB); regenerate with tools/ref_dump.py.
+*.npz
