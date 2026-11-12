@@ -1,7 +1,10 @@
 //! Linear layers in fp32 or Q4_32, plus an optional Q8_0 tied head.
 
 use crate::load::LoadError;
-use llm_cpu::{gemm_nt, gemm_q4, gemv_q4, gemv_q4_pair, linear, linear_add, Q4Matrix};
+use llm_cpu::{
+    for_ranges, gemm_q4, gemm_q4_add, gemv_q4, gemv_q4_add, gemv_q4_pair, linear, linear_add,
+    prefault_bytes, prefault_f32, ActQ8, Q4Matrix,
+};
 use llm_quant::{quantize_q8_0, BlockQ8_0, WeightFormat, BLOCK_SIZE};
 
 /// A weight matrix used as `Y = X @ W^T` (`W` is `[out, in]`).
@@ -60,6 +63,14 @@ impl Linear {
         }
     }
 
+    /// Fault in packed or fp32 weight pages.
+    pub fn prefault(&self) {
+        match self {
+            Self::F32 { weight, .. } => prefault_f32(weight),
+            Self::Q4(m) => m.prefault(),
+        }
+    }
+
     /// `out[tokens, rows] = x[tokens, cols] @ W^T`.
     pub fn apply(&self, x: &[f32], tokens: usize, out: &mut [f32]) {
         assert_eq!(x.len(), tokens * self.cols());
@@ -76,19 +87,15 @@ impl Linear {
         }
     }
 
-    /// `dst[tokens, rows] += x[tokens, cols] @ W^T` (fp32 uses f64 residual add).
+    /// `dst[tokens, rows] += x[tokens, cols] @ W^T` (f64 residual add).
     pub fn apply_add(&self, x: &[f32], tokens: usize, dst: &mut [f32]) {
         match self {
             Self::F32 { rows, cols, weight } => linear_add(x, weight, tokens, *cols, *rows, dst),
             Self::Q4(m) => {
-                let mut tmp = vec![0.0f32; tokens * m.n];
                 if tokens == 1 {
-                    gemv_q4(m, x, &mut tmp);
+                    gemv_q4_add(m, x, dst);
                 } else {
-                    gemm_q4(m, x, &mut tmp, tokens);
-                }
-                for (d, &s) in dst.iter_mut().zip(tmp.iter()) {
-                    *d = (f64::from(*d) + f64::from(s)) as f32;
+                    gemm_q4_add(m, x, dst, tokens);
                 }
             }
         }
@@ -133,6 +140,16 @@ impl Q8Matrix {
             blocks: quantize_q8_0(weight),
         }
     }
+
+    pub fn prefault(&self) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.blocks.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(self.blocks.as_slice()),
+            )
+        };
+        prefault_bytes(bytes);
+    }
 }
 
 /// Tied output head: same storage as a [`Linear`], plus a Q8 option.
@@ -159,26 +176,52 @@ impl OutputHead {
         }
     }
 
+    pub fn prefault(&self) {
+        match self {
+            Self::Linear(l) => l.prefault(),
+            Self::Q8(m) => m.prefault(),
+        }
+    }
+
     pub fn apply(&self, x: &[f32], tokens: usize, out: &mut [f32]) {
         match self {
             Self::Linear(l) => l.apply(x, tokens, out),
-            Self::Q8(_) => q8_apply(self, x, tokens, out),
+            Self::Q8(m) => q8_apply(m, x, tokens, out),
         }
     }
 }
 
-fn q8_apply(head: &OutputHead, x: &[f32], tokens: usize, out: &mut [f32]) {
-    let OutputHead::Q8(m) = head else {
-        unreachable!()
-    };
-    // Dequant + fp32 GEMM is correct and only used if someone picks a Q8 head.
-    // The default M2 path is Q4. Keep this simple.
-    let mut w = vec![0.0f32; m.n * m.k];
-    llm_quant::dequantize_q8_0(&m.blocks, &mut w);
+fn q8_apply(m: &Q8Matrix, x: &[f32], tokens: usize, out: &mut [f32]) {
+    let bpr = m.k / BLOCK_SIZE;
     if tokens == 1 {
-        // Still go through the fp32 GEMV so we can compare accuracy vs Q4.
-        gemm_nt(x, &w, out, 1, m.n, m.k);
-    } else {
-        gemm_nt(x, &w, out, tokens, m.n, m.k);
+        let acts = ActQ8::quantize(x);
+        let out_addr = out.as_mut_ptr() as usize;
+        for_ranges(m.n, |_tid, r0, r1| {
+            let out_ptr = out_addr as *mut f32;
+            for row in r0..r1 {
+                let mut acc = 0.0f32;
+                let row_w = &m.blocks[row * bpr..(row + 1) * bpr];
+                for (b, block) in row_w.iter().enumerate() {
+                    let a = &acts.qs[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+                    let mut s = 0i32;
+                    for (&wq, &aq) in block.qs.iter().zip(a.iter()) {
+                        s += i32::from(wq) * i32::from(aq);
+                    }
+                    acc += s as f32 * block.scale.to_f32() * acts.scales[b];
+                }
+                unsafe {
+                    *out_ptr.add(row) = acc;
+                }
+            }
+        });
+        return;
+    }
+    for t in 0..tokens {
+        q8_apply(
+            m,
+            &x[t * m.k..(t + 1) * m.k],
+            1,
+            &mut out[t * m.n..(t + 1) * m.n],
+        );
     }
 }

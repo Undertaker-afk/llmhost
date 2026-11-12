@@ -373,6 +373,11 @@ fn lfm2_700m_matches_golden() {
     let mut reports = Vec::new();
     let mut all_ok = true;
     for name in PROMPTS {
+        if !dir.join(format!("{name}.npz")).is_file() {
+            // Individual dumps may be absent even when the manifest is present.
+            eprintln!("note: {name}.npz is not present; skipping that prompt");
+            continue;
+        }
         let do_greedy = GREEDY_PROMPTS.contains(name);
         let report = eval_prompt(&model, &dir, name, do_greedy);
         print_report(&report);

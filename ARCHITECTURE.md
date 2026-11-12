@@ -50,6 +50,14 @@ bytes per token:
   reference machine and on an x86-64-v3 Zen 2 host (AVX2 only). Kernel
   selection is always at runtime.
 
+Q4 weights are packed at load into 16-row VNNI tiles (unsigned nibbles plus
+f32 scales). When AMX-INT8 is available the matching B panels are also
+pre-packed in the 8×64 signed layout the tiles expect, and pages are
+touched so the first run is not dominated by faults. Decode GEMV uses a
+process-wide pinned spin pool: each thread keeps a fixed row range of every
+matrix. Prefill GEMM reuses each weight tile across the token axis and, on
+AMX, a 2×2 tile kernel (32 tokens × 32 outputs per step).
+
 A wgpu GPU backend remains in scope for later milestones. On machines
 without a GPU, software Vulkan (lavapipe) can be used to check
 correctness, not speed.

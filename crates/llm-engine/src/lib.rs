@@ -19,7 +19,7 @@ mod weights;
 pub use batch::{Engine, EngineError, ForwardBatch, ForwardOutput, SeqInput, SeqLogits};
 pub use cache::{ConvSnapshot, ConvState, PagedKv, KV_BLOCK_TOKENS};
 pub use draft::{DraftModel, DraftProposal};
-pub use lfm2::{LayerTraces, Lfm2Cache, Lfm2Model};
+pub use lfm2::{DecodeProfile, DecodeScratch, LayerTraces, Lfm2Cache, Lfm2Model, Q4LoadOpts};
 pub use load::{find_hf_snapshot, load_config, load_safetensors_f32, LoadError};
 pub use npy::{read_npy, read_npz, NpyArray, NpyData};
 pub use schedule::Scheduler;

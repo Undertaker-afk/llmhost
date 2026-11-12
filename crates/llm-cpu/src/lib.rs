@@ -4,6 +4,7 @@
 //! fall back to AVX2, then to a scalar reference. Selection is always at
 //! runtime; builds must not use `-C target-cpu=native`.
 
+mod amx;
 mod conv;
 mod features;
 mod gemm;
@@ -13,15 +14,20 @@ mod ops;
 mod pool;
 mod rope;
 
+pub use amx::amx_ready;
 pub use conv::{causal_dwconv_prefill, causal_dwconv_update};
 pub use features::{CpuFeatures, KernelSet};
 pub use gemm::{gemm_nt, gemv_nt, linear, linear_add};
 pub use gemv_q4::{
-    detect_q4_kernel, gemm_q4, gemv_q4, gemv_q4_pair, gemv_q4_prep, ActQ8, Q4Kernel, Q4Matrix,
+    current_act_quant, detect_q4_kernel, gemm_q4, gemm_q4_add, gemv_q4, gemv_q4_add, gemv_q4_pair,
+    gemv_q4_prep, set_act_quant, ActQ8, ActQuant, Q4Kernel, Q4Matrix,
 };
 pub use matvec::{matvec_f32, matvec_f32_avx2, matvec_f32_scalar};
 pub use ops::{add, add_inplace, argmax, mul, rms_norm, silu, silu_inplace, softmax_last_axis};
-pub use pool::with_threads;
+pub use pool::{
+    alloc_prefaulted, current_threads, for_ranges, for_threads, prefault_bytes, prefault_f32,
+    thread_range, with_threads,
+};
 pub use rope::{apply_rope_in_place, cos_sin, inv_freq};
 
 use llm_core::Backend;
