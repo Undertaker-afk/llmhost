@@ -1,7 +1,7 @@
 use crate::{LayerKind, ModelConfig};
 
 /// Placeholder model. Weights, blocks, and a tokenizer are added in M1.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     /// Architecture and layer graph for this model.
     pub config: ModelConfig,
@@ -32,7 +32,13 @@ mod tests {
             model_type: "lfm2".into(),
             hidden_size: 8,
             num_hidden_layers: 2,
-            layers: vec![LayerKind::Conv, LayerKind::Attention],
+            layers: vec![
+                LayerKind::Conv { kernel: 3 },
+                LayerKind::Attention {
+                    sliding_window: None,
+                    rope: crate::RopeParams::default(),
+                },
+            ],
         };
         let model = Model::new(config);
         assert_eq!(model.layers().len(), 2);

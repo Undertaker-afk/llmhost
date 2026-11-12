@@ -235,6 +235,10 @@ dependencies = [
 [[package]]
 name = "llm-engine"
 version = "0.1.0"
+dependencies = [
+ "llm-core",
+ "llm-quant",
+]
 
 [[package]]
 name = "llm-gpu-wgpu"

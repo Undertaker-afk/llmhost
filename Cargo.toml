@@ -23,3 +23,4 @@ half = "2"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 llm-core = { path = "crates/llm-core" }
+llm-quant = { path = "crates/llm-quant" }

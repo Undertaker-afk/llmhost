@@ -1,8 +1,25 @@
-//! Inference engine: sessions, caches, and sampling.
+//! Inference engine: sessions, caches, batching, and sampling.
 //!
-//! This skeleton only ships the sampler configuration and a deterministic
-//! greedy argmax. Temperature, top-k, top-p, and min-p are stored on
-//! [`SamplerConfig`] and will be applied in a later milestone.
+//! The batch-first API in [`batch`] returns logits for every token position
+//! and can accept or roll back a speculative tree by token index (the
+//! accepted path need not be a prefix). Temperature / nucleus sampling is
+//! still a stub; [`Sampler::sample`] is greedy argmax so tests stay
+//! deterministic.
+
+mod batch;
+mod cache;
+mod draft;
+mod schedule;
+mod tree;
+
+pub use batch::{Engine, EngineError, ForwardBatch, ForwardOutput, SeqInput, SeqLogits};
+pub use cache::{ConvSnapshot, ConvState, PagedKv, KV_BLOCK_TOKENS};
+pub use draft::{DraftModel, DraftProposal};
+pub use schedule::Scheduler;
+pub use tree::{
+    effective_tree, linear_tree, validate_accept_path, validate_tree, validate_tree_for_tokens,
+    TreeError,
+};
 
 /// Sampling parameters for a generation run.
 #[derive(Clone, Copy, Debug, PartialEq)]

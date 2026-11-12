@@ -6,13 +6,33 @@ and treats the CPU as the primary backend.
 
 ## Config-driven layer graph
 
-`ModelConfig` is parsed from a Hugging Face `config.json`. The file is turned
-into a `Vec<LayerKind>` (`Conv`, `Attention`, or `Other(String)` for types
-that are not wired yet, such as an LFM3 MoE block).
+`ModelConfig` is parsed from a Hugging Face `config.json` into a
+`Vec<LayerKind>`. Vision configs (`lfm2_vl`, `lfm3_vl`) are read from the
+nested `text_config` object. A new family only needs new block types and a
+mapping from its config; it does not need a second runtime.
 
-The graph is a sequence of `Block` implementations chosen from that list, so
-LFM2 and LFM3 share the engine. A new family only needs new block types and
-a mapping from its config; it does not need a second runtime.
+`LayerKind` is:
+
+- `Conv { kernel }` — `kernel` is `conv_L_cache` (3 on LFM2, 7 on LFM3). The
+  rolling conv state is `kernel - 1`.
+- `Attention { sliding_window, rope: RopeParams { theta, partial_rotary_factor } }`
+  — `sliding_window` is `Some` for LFM3 `sliding_attention` layers and `None`
+  for full attention.
+- `Moe` — reserved for a mixture-of-experts block.
+- `Other(String)` — unknown type names, so a future layer can be described
+  before its kernels exist.
+
+Layer lists come from the config as follows:
+
+- **LFM2:** `layer_types` when present (e.g. 2.6B). Smaller LFM2 checkpoints
+  (700M / 1.2B / 350M) omit that list and use `full_attn_idxs` plus
+  `num_hidden_layers` (those indices are full attention; the rest are conv).
+  RoPE is the top-level `rope_theta` (or `theta`, or a flat
+  `rope_parameters` object).
+- **LFM3:** `layer_types` of `conv`, `full_attention`, and
+  `sliding_attention`, with a global `sliding_window` (256) and per-type
+  `rope_parameters` (`rope_theta` and optional `partial_rotary_factor` for
+  `full_attention` and `sliding_attention`).
 
 ## CPU first
 
@@ -33,19 +53,44 @@ the kernels exist to cut bytes per token:
 A wgpu GPU backend remains in scope for later milestones, but it cannot be
 benchmarked here (lavapipe can only check correctness).
 
+## Formats
+
+`WeightFormat` is `F32`, `F16`, `BF16`, `Q8_0`, `Q4_32`, or `Nvfp4`.
+`Nvfp4` is reserved for the later GPU path and returns `Unsupported` if
+selected. `KvDtype` is `F16`, `Q8`, or `K8V4` (8-bit keys, 4-bit values).
+
+## Batch-first engine
+
+The engine runs a `ForwardBatch` of `SeqInput`s (sequence id, tokens,
+start position, block table, optional tree) and returns logits for **every**
+token position, not just the last.
+
+A `tree` is a parent-index mask, one entry per token, with `-1` as a root.
+`None` means a linear chain. Parents must precede children. After a
+speculative forward, `accept` / `rollback` take a list of token indices.
+The accepted path need not be a prefix of the list (a branch can be chosen)
+but must be a connected path in the tree. That path is applied to:
+
+- the paged KV cache (16-token blocks, attention layers only)
+- conv-state snapshots (rolling state for conv layers)
+
+`Scheduler` is a placeholder for continuous batching. `DraftModel::propose`
+returns draft tokens and a tree for later tree-verification decode.
+
 ## State
 
-- **Attention layers** keep a paged KV cache (blocks of 16 tokens, f16 or
-  optional Q8) with prefix reuse across multi-turn turns.
+- **Attention layers** keep a paged KV cache (`PagedKv`, blocks of 16
+  tokens, dtype `KvDtype`) with prefix reuse across multi-turn turns.
 - **Conv layers** keep a small rolling state of kernel-size minus one per
-  layer, not a KV cache.
+  layer (`ConvState`), snapshotted so a rejected draft branch can be rolled
+  back.
 
 ## Crates
 
-- `llm-core` — shapes, tensors, `Backend`, `Block`, `ModelConfig`, placeholder `Model`.
+- `llm-core` — shapes, tensors, `Backend`, `Block`, `ModelConfig`, `LayerKind`, placeholder `Model`.
 - `llm-cpu` — feature detection, `KernelSet`, CPU kernels.
-- `llm-quant` — Q8_0 and Q4 block formats, plus the future `.lfmb` container.
-- `llm-engine` — sessions, cache, batching, sampling, tokenizer / chat template.
+- `llm-quant` — Q8_0 and Q4 block formats, `WeightFormat`, `KvDtype`, plus the future `.lfmb` container.
+- `llm-engine` — sessions, paged KV / conv state, batch-first forward, sampling, tokenizer / chat template.
 - `llm-capi` — C ABI (cbindgen header in a later milestone).
 - `llm-server` — axum, `127.0.0.1` by default, OpenAI and Anthropic routes.
 - `llm-gpu-wgpu` — default GPU path (Vulkan / Metal / DX12 via WGSL).
@@ -67,5 +112,6 @@ Each milestone has a test gate.
 | **M5** | LFM2-VL / LFM3-VL | vision encoder, projector, image inputs in both APIs |
 | **M6** | 2B-class models, CUDA and Metal fast paths, C ABI and docs | correctness + benches on real GPUs |
 
-The CPU throughput targets and the later GPU target (RTX 5090-class, 27B)
-are in [ROADMAP.md](ROADMAP.md).
+The CPU throughput targets and the later GPU target (RTX 5090-class, 27B,
+NVFP4, speculative tree verify, 8-stream totals) are in
+[ROADMAP.md](ROADMAP.md).

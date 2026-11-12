@@ -12,8 +12,7 @@ mod tensor;
 
 pub use backend::Backend;
 pub use block::Block;
-pub use config::LayerKind;
-pub use config::{ConfigError, ModelConfig};
+pub use config::{ConfigError, LayerKind, ModelConfig, RopeParams};
 pub use model::Model;
 pub use shape::Shape;
 pub use tensor::{Tensor, TensorError};

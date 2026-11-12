@@ -7,3 +7,5 @@ publish.workspace = true
 description = "Sessions, sampling, and KV/conv state for llmhost."
 
 [dependencies]
+llm-core.workspace = true
+llm-quant.workspace = true

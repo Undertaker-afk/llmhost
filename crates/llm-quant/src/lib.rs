@@ -5,6 +5,9 @@
 
 use half::f16;
 
+mod formats;
+pub use formats::{KvDtype, QuantError, WeightFormat};
+
 /// Number of elements in a Q8_0 or Q4 block.
 pub const BLOCK_SIZE: usize = 32;
 
