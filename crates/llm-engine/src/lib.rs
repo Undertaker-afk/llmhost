@@ -9,12 +9,18 @@
 mod batch;
 mod cache;
 mod draft;
+mod lfm2;
+mod load;
+mod npy;
 mod schedule;
 mod tree;
 
 pub use batch::{Engine, EngineError, ForwardBatch, ForwardOutput, SeqInput, SeqLogits};
 pub use cache::{ConvSnapshot, ConvState, PagedKv, KV_BLOCK_TOKENS};
 pub use draft::{DraftModel, DraftProposal};
+pub use lfm2::{LayerTraces, Lfm2Cache, Lfm2Model};
+pub use load::{find_hf_snapshot, load_config, load_safetensors_f32, LoadError};
+pub use npy::{read_npy, read_npz, NpyArray, NpyData};
 pub use schedule::Scheduler;
 pub use tree::{
     effective_tree, linear_tree, validate_accept_path, validate_tree, validate_tree_for_tokens,

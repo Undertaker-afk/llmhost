@@ -39,6 +39,7 @@ mod tests {
                     rope: crate::RopeParams::default(),
                 },
             ],
+            ..ModelConfig::default()
         };
         let model = Model::new(config);
         assert_eq!(model.layers().len(), 2);

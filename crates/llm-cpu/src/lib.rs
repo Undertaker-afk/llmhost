@@ -4,11 +4,19 @@
 //! fall back to AVX2, then to a scalar reference. Selection is always at
 //! runtime; builds must not use `-C target-cpu=native`.
 
+mod conv;
 mod features;
+mod gemm;
 mod matvec;
+mod ops;
+mod rope;
 
+pub use conv::{causal_dwconv_prefill, causal_dwconv_update};
 pub use features::{CpuFeatures, KernelSet};
+pub use gemm::{gemm_nt, gemv_nt, linear, with_threads};
 pub use matvec::{matvec_f32, matvec_f32_avx2, matvec_f32_scalar};
+pub use ops::{add, add_inplace, argmax, mul, rms_norm, silu, silu_inplace, softmax_last_axis};
+pub use rope::{apply_rope_in_place, cos_sin, inv_freq};
 
 use llm_core::Backend;
 

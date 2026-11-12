@@ -1,0 +1,4 @@
+# Baseline is x86-64-v3 (AVX2 + FMA + BMI). Do not use target-cpu=native:
+# that would bake in AMX/AVX-512 and break the Zen 2 secondary target.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

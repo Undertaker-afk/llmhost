@@ -136,6 +136,41 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     /// Per-layer kinds, in stack order. This is what builds the graph.
     pub layers: Vec<LayerKind>,
+    /// Vocabulary size (`vocab_size`).
+    pub vocab_size: usize,
+    /// Query heads (`num_attention_heads` / `num_heads`).
+    pub num_attention_heads: usize,
+    /// Key/value heads (`num_key_value_heads`).
+    pub num_key_value_heads: usize,
+    /// Per-head dimension (`head_dim`, or `hidden_size / num_attention_heads`).
+    pub head_dim: usize,
+    /// SwiGLU intermediate size, after `block_auto_adjust_ff_dim` rounding.
+    pub intermediate_size: usize,
+    /// RMSNorm epsilon (`norm_eps`).
+    pub norm_eps: f32,
+    /// Whether conv / in_proj / out_proj have a bias (`conv_bias`).
+    pub conv_bias: bool,
+    /// Whether `lm_head` shares `embed_tokens` (`tie_word_embeddings`).
+    pub tie_word_embeddings: bool,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            model_type: String::new(),
+            hidden_size: 0,
+            num_hidden_layers: 0,
+            layers: Vec::new(),
+            vocab_size: 0,
+            num_attention_heads: 0,
+            num_key_value_heads: 0,
+            head_dim: 0,
+            intermediate_size: 0,
+            norm_eps: 1e-5,
+            conv_bias: false,
+            tie_word_embeddings: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -176,6 +211,36 @@ struct HfConfig {
     /// Language-tower config on LFM2-VL / LFM3-VL.
     #[serde(default)]
     text_config: Option<Box<HfConfig>>,
+    #[serde(default)]
+    vocab_size: usize,
+    #[serde(default)]
+    num_attention_heads: Option<usize>,
+    #[serde(default)]
+    num_heads: Option<usize>,
+    #[serde(default)]
+    num_key_value_heads: usize,
+    #[serde(default)]
+    head_dim: Option<usize>,
+    #[serde(default)]
+    intermediate_size: Option<usize>,
+    #[serde(default)]
+    block_ff_dim: Option<usize>,
+    #[serde(default)]
+    block_auto_adjust_ff_dim: Option<bool>,
+    #[serde(default)]
+    block_ffn_dim_multiplier: Option<f64>,
+    #[serde(default)]
+    block_multiple_of: Option<usize>,
+    #[serde(default)]
+    norm_eps: Option<f32>,
+    #[serde(default)]
+    block_norm_eps: Option<f32>,
+    #[serde(default)]
+    conv_bias: Option<bool>,
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
+    #[serde(default)]
+    tie_embedding: Option<bool>,
 }
 
 impl HfConfig {
@@ -295,13 +360,57 @@ impl ModelConfig {
         } else {
             layers.len()
         };
+        let num_attention_heads = raw.num_attention_heads.or(raw.num_heads).unwrap_or(0);
+        let num_key_value_heads = if raw.num_key_value_heads > 0 {
+            raw.num_key_value_heads
+        } else {
+            num_attention_heads
+        };
+        let head_dim = raw.head_dim.unwrap_or_else(|| {
+            raw.hidden_size
+                .checked_div(num_attention_heads)
+                .unwrap_or(0)
+        });
+        let intermediate_size = compute_intermediate_size(&raw);
+        let norm_eps = raw.norm_eps.or(raw.block_norm_eps).unwrap_or(1e-5);
+        let tie_word_embeddings = raw
+            .tie_word_embeddings
+            .or(raw.tie_embedding)
+            .unwrap_or(true);
         Self {
             model_type: raw.model_type,
             hidden_size: raw.hidden_size,
             num_hidden_layers,
             layers,
+            vocab_size: raw.vocab_size,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            intermediate_size,
+            norm_eps,
+            conv_bias: raw.conv_bias.unwrap_or(false),
+            tie_word_embeddings,
         }
     }
+}
+
+/// Apply LFM2 `block_auto_adjust_ff_dim` (same arithmetic as `Lfm2MLP`).
+fn compute_intermediate_size(raw: &HfConfig) -> usize {
+    let mut size = raw.intermediate_size.or(raw.block_ff_dim).unwrap_or(0);
+    if size == 0 {
+        return 0;
+    }
+    if raw.block_auto_adjust_ff_dim.unwrap_or(false) {
+        size = (2 * size) / 3;
+        if let Some(mult) = raw.block_ffn_dim_multiplier {
+            size = (mult * size as f64) as usize;
+        }
+        let multiple = raw.block_multiple_of.unwrap_or(256);
+        if multiple > 0 {
+            size = multiple * size.div_ceil(multiple);
+        }
+    }
+    size
 }
 
 #[cfg(test)]
@@ -463,6 +572,33 @@ mod tests {
         assert!(is_conv(&cfg.layers[5], 7));
         assert!(is_full(&cfg.layers[6], full));
         assert!(is_conv(&cfg.layers[7], 7));
+    }
+
+    #[test]
+    fn computes_lfm2_700m_intermediate_size() {
+        let json = r#"{
+            "model_type": "lfm2",
+            "hidden_size": 1536,
+            "num_hidden_layers": 16,
+            "full_attn_idxs": [2, 5, 8, 10, 12, 14],
+            "num_attention_heads": 24,
+            "num_key_value_heads": 8,
+            "block_ff_dim": 10240,
+            "block_auto_adjust_ff_dim": true,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_multiple_of": 256,
+            "vocab_size": 65536,
+            "norm_eps": 1e-05,
+            "conv_L_cache": 3,
+            "rope_theta": 1000000.0
+        }"#;
+        let cfg = ModelConfig::from_json(json).unwrap();
+        assert_eq!(cfg.intermediate_size, 6912);
+        assert_eq!(cfg.head_dim, 64);
+        assert_eq!(cfg.num_attention_heads, 24);
+        assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.vocab_size, 65536);
+        assert!((cfg.norm_eps - 1e-5).abs() < 1e-12);
     }
 
     #[test]

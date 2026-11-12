@@ -9,3 +9,10 @@ description = "Sessions, sampling, and KV/conv state for llmhost."
 [dependencies]
 llm-core.workspace = true
 llm-quant.workspace = true
+llm-cpu.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+zip.workspace = true
+serde_json.workspace = true
+half.workspace = true
