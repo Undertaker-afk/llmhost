@@ -1,0 +1,10 @@
+[package]
+name = "llm-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Block quantization formats (Q8_0, Q4) for llmhost."
+
+[dependencies]
+half.workspace = true

@@ -1,0 +1,68 @@
+//! CPU backend: runtime feature detection and kernels.
+//!
+//! Decode prefers AVX-512 VNNI GEMV; prefill prefers AMX int8 tiles. Both
+//! fall back to AVX2, then to a scalar reference. Selection is always at
+//! runtime; builds must not use `-C target-cpu=native`.
+
+mod features;
+mod matvec;
+
+pub use features::{CpuFeatures, KernelSet};
+pub use matvec::{matvec_f32, matvec_f32_avx2, matvec_f32_scalar};
+
+use llm_core::Backend;
+
+/// CPU backend. Kernel dispatch is based on [`CpuFeatures::detect`].
+#[derive(Clone, Debug)]
+pub struct CpuBackend {
+    /// Detected instruction-set flags.
+    pub features: CpuFeatures,
+    /// Preferred kernel set for decode (VNNI GEMV when present).
+    pub decode: KernelSet,
+    /// Preferred kernel set for prefill (AMX when present).
+    pub prefill: KernelSet,
+}
+
+impl CpuBackend {
+    /// Detect features on this machine and pick kernel sets.
+    #[must_use]
+    pub fn new() -> Self {
+        let features = CpuFeatures::detect();
+        Self {
+            decode: features.decode_kernels(),
+            prefill: features.prefill_kernels(),
+            features,
+        }
+    }
+}
+
+impl Default for CpuBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Backend for CpuBackend {
+    type Buffer = Vec<f32>;
+
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+
+    fn alloc(&self, len: usize) -> Self::Buffer {
+        vec![0.0; len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CpuBackend;
+    use llm_core::Backend;
+
+    #[test]
+    fn backend_allocates() {
+        let backend = CpuBackend::new();
+        assert_eq!(backend.name(), "cpu");
+        assert_eq!(backend.alloc(4).len(), 4);
+    }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "llm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Tensor types, backend/block traits, and model config for llmhost."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

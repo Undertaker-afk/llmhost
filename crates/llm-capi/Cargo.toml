@@ -1,0 +1,13 @@
+[package]
+name = "llm-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C ABI for llmhost."
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+name = "llmhost"
+
+[dependencies]
