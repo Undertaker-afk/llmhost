@@ -24,6 +24,22 @@ A second CPU target is an x86-64-v3 Zen 2 host (AVX2 only). It is not the
 40 tok/s gate. Binaries for that class of machine are built for x86-64-v3,
 not `-C target-cpu=native`.
 
+## Competitive targets
+
+The CPU bar is to beat llama.cpp on the same machine, with the same model,
+quantization, prompts, and thread count, measured back to back on a quiet
+machine. The current reference point for LFM2-700M Q4_0 at 8 threads is
+about **140 tok/s decode** and about **1290 tok/s prefill** on a 512-token
+prompt.
+
+Batch-1 decode is memory-bandwidth bound, so wins come from fewer bytes
+per token (a lean 4-bit format and a quantized head), speculative decoding
+(prompt lookup, an LFM2.5-230M draft model), AMX int8 prefill, and fused
+LFM conv / SwiGLU kernels.
+
+The multi-stream bar is to beat vLLM on total tok/s across 1, 4, and 8
+streams, first on the CPU backend and later on GPU.
+
 ## Long-term: GPU
 
 The later speed target is a single **RTX 5090-class** GPU running a
@@ -49,3 +65,4 @@ include:
 - lane counts of 1, 4, and 8
 - code vs prose prompts
 - speculative decoding on vs off, with the accept rate when it is on
+- prefill reported separately from decode

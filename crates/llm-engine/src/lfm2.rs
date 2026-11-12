@@ -9,11 +9,13 @@ use crate::load::{
     find_hf_snapshot, get_tensor, load_config, load_safetensors_f32, squeeze_conv_weight,
     LoadError, TensorF32,
 };
+use crate::weights::{apply_pair, Linear, OutputHead};
 use llm_core::{LayerKind, ModelConfig};
 use llm_cpu::{
     add_inplace, apply_rope_in_place, argmax, causal_dwconv_prefill, causal_dwconv_update, cos_sin,
-    inv_freq, linear, mul, rms_norm, silu_inplace, softmax_last_axis,
+    inv_freq, mul, rms_norm, silu_inplace, softmax_last_axis,
 };
+use llm_quant::WeightFormat;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -31,27 +33,27 @@ struct Rms {
 }
 
 struct Ffn {
-    w1: Vec<f32>,
-    w2: Vec<f32>,
-    w3: Vec<f32>,
+    w1: Linear,
+    w2: Linear,
+    w3: Linear,
     ffn_norm: Rms,
 }
 
 struct ConvBlock {
     operator_norm: Rms,
-    in_proj: Vec<f32>,
+    in_proj: Linear,
     conv_w: Vec<f32>,
-    out_proj: Vec<f32>,
+    out_proj: Linear,
     ffn: Ffn,
     kernel: usize,
 }
 
 struct AttnBlock {
     operator_norm: Rms,
-    q_proj: Vec<f32>,
-    k_proj: Vec<f32>,
-    v_proj: Vec<f32>,
-    out_proj: Vec<f32>,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
     q_norm: Rms,
     k_norm: Rms,
     ffn: Ffn,
@@ -74,12 +76,17 @@ pub struct Lfm2Cache {
     v: Vec<Option<Vec<f32>>>,
     /// Reserved capacity along the time axis of K/V (so greedy decode does not realloc).
     kv_cap: usize,
+    /// Per-position key mask (`true` = attend). Prompt pads may be false;
+    /// newly decoded tokens are always valid, matching HF `generate`.
+    key_valid: Vec<bool>,
 }
 
-/// LFM2 model with fp32 weights.
+/// LFM2 model. Linear layers are fp32 or Q4_32 depending on how it was loaded.
 pub struct Lfm2Model {
     pub config: ModelConfig,
+    pub format: WeightFormat,
     embed: Vec<f32>,
+    head: OutputHead,
     embedding_norm: Rms,
     blocks: Vec<Block>,
     inv_freq: Vec<f32>,
@@ -88,10 +95,17 @@ pub struct Lfm2Model {
 impl Lfm2Model {
     /// Load from a snapshot directory that has `config.json` + `model.safetensors`.
     pub fn load_dir(dir: impl AsRef<Path>) -> Result<Self, LoadError> {
+        Self::load_dir_with(dir, WeightFormat::F32)
+    }
+
+    /// Load a snapshot, quantizing every linear layer to `format` at load time.
+    /// Embeddings, RMSNorms, and the depthwise conv kernel stay fp32. The tied
+    /// LM head uses the same format as the other linears (Q4_32 or fp32).
+    pub fn load_dir_with(dir: impl AsRef<Path>, format: WeightFormat) -> Result<Self, LoadError> {
         let dir = dir.as_ref();
         let config = load_config(dir)?;
         let tensors = load_safetensors_f32(dir.join("model.safetensors"))?;
-        Self::from_tensors(config, &tensors)
+        Self::from_tensors(config, &tensors, format)
     }
 
     /// Locate the LFM2-700M snapshot in the local Hub cache (no download) and load it.
@@ -100,9 +114,16 @@ impl Lfm2Model {
         Self::load_dir(dir)
     }
 
+    /// LFM2-700M with Q4_32 linear layers (and a Q4 tied head).
+    pub fn load_lfm2_700m_q4() -> Result<Self, LoadError> {
+        let dir = find_hf_snapshot("LiquidAI/LFM2-700M", "86f49fc9")?;
+        Self::load_dir_with(dir, WeightFormat::Q4_32)
+    }
+
     fn from_tensors(
         config: ModelConfig,
         tensors: &HashMap<String, TensorF32>,
+        format: WeightFormat,
     ) -> Result<Self, LoadError> {
         let h = config.hidden_size;
         let embed = get_tensor(tensors, "model.embed_tokens.weight")?;
@@ -112,15 +133,9 @@ impl Lfm2Model {
         for (i, kind) in config.layers.iter().enumerate() {
             let prefix = format!("model.layers.{i}");
             let ffn = Ffn {
-                w1: named(tensors, &format!("{prefix}.feed_forward.w1.weight"))?
-                    .data
-                    .clone(),
-                w2: named(tensors, &format!("{prefix}.feed_forward.w2.weight"))?
-                    .data
-                    .clone(),
-                w3: named(tensors, &format!("{prefix}.feed_forward.w3.weight"))?
-                    .data
-                    .clone(),
+                w1: linear_named(tensors, &format!("{prefix}.feed_forward.w1.weight"), format)?,
+                w2: linear_named(tensors, &format!("{prefix}.feed_forward.w2.weight"), format)?,
+                w3: linear_named(tensors, &format!("{prefix}.feed_forward.w3.weight"), format)?,
                 ffn_norm: rms(
                     get_tensor(tensors, &format!("{prefix}.ffn_norm.weight"))?,
                     h,
@@ -134,13 +149,17 @@ impl Lfm2Model {
                             get_tensor(tensors, &format!("{prefix}.operator_norm.weight"))?,
                             h,
                         )?,
-                        in_proj: named(tensors, &format!("{prefix}.conv.in_proj.weight"))?
-                            .data
-                            .clone(),
+                        in_proj: linear_named(
+                            tensors,
+                            &format!("{prefix}.conv.in_proj.weight"),
+                            format,
+                        )?,
                         conv_w: squeeze_conv_weight(conv)?,
-                        out_proj: named(tensors, &format!("{prefix}.conv.out_proj.weight"))?
-                            .data
-                            .clone(),
+                        out_proj: linear_named(
+                            tensors,
+                            &format!("{prefix}.conv.out_proj.weight"),
+                            format,
+                        )?,
                         ffn,
                         kernel: *kernel,
                     }));
@@ -151,18 +170,26 @@ impl Lfm2Model {
                             get_tensor(tensors, &format!("{prefix}.operator_norm.weight"))?,
                             h,
                         )?,
-                        q_proj: named(tensors, &format!("{prefix}.self_attn.q_proj.weight"))?
-                            .data
-                            .clone(),
-                        k_proj: named(tensors, &format!("{prefix}.self_attn.k_proj.weight"))?
-                            .data
-                            .clone(),
-                        v_proj: named(tensors, &format!("{prefix}.self_attn.v_proj.weight"))?
-                            .data
-                            .clone(),
-                        out_proj: named(tensors, &format!("{prefix}.self_attn.out_proj.weight"))?
-                            .data
-                            .clone(),
+                        q_proj: linear_named(
+                            tensors,
+                            &format!("{prefix}.self_attn.q_proj.weight"),
+                            format,
+                        )?,
+                        k_proj: linear_named(
+                            tensors,
+                            &format!("{prefix}.self_attn.k_proj.weight"),
+                            format,
+                        )?,
+                        v_proj: linear_named(
+                            tensors,
+                            &format!("{prefix}.self_attn.v_proj.weight"),
+                            format,
+                        )?,
+                        out_proj: linear_named(
+                            tensors,
+                            &format!("{prefix}.self_attn.out_proj.weight"),
+                            format,
+                        )?,
                         q_norm: rms(
                             get_tensor(tensors, &format!("{prefix}.self_attn.q_layernorm.weight"))?,
                             config.head_dim,
@@ -192,9 +219,12 @@ impl Lfm2Model {
                 })
                 .unwrap_or(1_000_000.0),
         );
+        let head = OutputHead::from_embed(&embed.data, config.vocab_size, h, format)?;
         Ok(Self {
             config,
+            format,
             embed: embed.data.clone(),
+            head,
             embedding_norm,
             blocks,
             inv_freq: inv,
@@ -216,8 +246,24 @@ impl Lfm2Model {
     pub fn prefill(
         &self,
         tokens: &[u32],
+        traces: Option<&mut LayerTraces>,
+        kv_reserve: usize,
+    ) -> Lfm2Cache {
+        self.prefill_masked(tokens, traces, kv_reserve, None)
+    }
+
+    /// Prefill with an optional pad id. Positions equal to `pad_token_id` are
+    /// treated like Hugging Face `generate` when it is given that pad id:
+    /// conv inputs at those positions are zeroed and attention does not
+    /// attend to them. Newly decoded tokens stay visible even if they equal
+    /// the pad id. Layer traces for an unpadded prefill should keep
+    /// `pad_token_id` as `None`.
+    pub fn prefill_masked(
+        &self,
+        tokens: &[u32],
         mut traces: Option<&mut LayerTraces>,
         kv_reserve: usize,
+        pad_token_id: Option<u32>,
     ) -> Lfm2Cache {
         let t = tokens.len();
         let h = self.hidden();
@@ -227,6 +273,7 @@ impl Lfm2Model {
             let id = id as usize;
             hidden[i * h..(i + 1) * h].copy_from_slice(&self.embed[id * h..(id + 1) * h]);
         }
+        let key_valid: Vec<bool> = tokens.iter().map(|&id| pad_token_id != Some(id)).collect();
         if let Some(tr) = traces.as_mut() {
             tr.embed = hidden.clone();
             tr.layers.clear();
@@ -239,20 +286,21 @@ impl Lfm2Model {
             k: Vec::with_capacity(self.blocks.len()),
             v: Vec::with_capacity(self.blocks.len()),
             kv_cap: cap,
+            key_valid: Vec::new(),
         };
 
         for block in &self.blocks {
             match block {
                 Block::Conv(conv) => {
                     let mut state = vec![0.0f32; h * conv.kernel.saturating_sub(1)];
-                    self.conv_prefill(conv, &mut hidden, t, &mut state);
+                    self.conv_prefill(conv, &mut hidden, t, &mut state, &key_valid);
                     self.ffn_residual(&conv.ffn, &mut hidden, t);
                     cache.conv.push(Some(state));
                     cache.k.push(None);
                     cache.v.push(None);
                 }
                 Block::Attn(attn) => {
-                    let (k, v) = self.attn_prefill(attn, &mut hidden, t, 0, cap);
+                    let (k, v) = self.attn_prefill(attn, &mut hidden, t, 0, cap, &key_valid);
                     self.ffn_residual(&attn.ffn, &mut hidden, t);
                     cache.conv.push(None);
                     cache.k.push(Some(k));
@@ -263,6 +311,7 @@ impl Lfm2Model {
                 tr.layers.push(hidden.clone());
             }
         }
+        cache.key_valid = key_valid;
 
         let mut normed = vec![0.0f32; t * h];
         rms_norm(
@@ -272,7 +321,7 @@ impl Lfm2Model {
             &mut normed,
         );
         let mut logits = vec![0.0f32; t * v];
-        linear(&normed, &self.embed, t, h, v, &mut logits);
+        self.head.apply(&normed, t, &mut logits);
         if let Some(tr) = traces.as_mut() {
             tr.final_norm = normed;
             tr.logits = logits;
@@ -287,6 +336,8 @@ impl Lfm2Model {
         let id = token as usize;
         let mut hidden = self.embed[id * h..(id + 1) * h].to_vec();
         let pos = cache.seq_len;
+        // Generated tokens are never treated as padding.
+        cache.key_valid.push(true);
 
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             match block {
@@ -305,6 +356,7 @@ impl Lfm2Model {
                         cache.k[layer_idx].as_mut().unwrap(),
                         cache.v[layer_idx].as_mut().unwrap(),
                         cache.kv_cap,
+                        &cache.key_valid,
                     );
                     self.ffn_residual(&attn.ffn, &mut hidden, 1);
                 }
@@ -319,7 +371,7 @@ impl Lfm2Model {
             &mut normed,
         );
         let mut logits = vec![0.0f32; v];
-        linear(&normed, &self.embed, 1, h, v, &mut logits);
+        self.head.apply(&normed, 1, &mut logits);
         logits
     }
 
@@ -347,7 +399,14 @@ impl Lfm2Model {
         (ids, all_logits)
     }
 
-    fn conv_prefill(&self, conv: &ConvBlock, hidden: &mut [f32], t: usize, state: &mut [f32]) {
+    fn conv_prefill(
+        &self,
+        conv: &ConvBlock,
+        hidden: &mut [f32],
+        t: usize,
+        state: &mut [f32],
+        key_valid: &[bool],
+    ) {
         let h = self.hidden();
         let mut normed = vec![0.0f32; t * h];
         rms_norm(
@@ -356,8 +415,16 @@ impl Lfm2Model {
             self.config.norm_eps,
             &mut normed,
         );
+        // Match Lfm2ShortConv: zero padding positions before in_proj.
+        if key_valid.len() == t {
+            for (i, valid) in key_valid.iter().enumerate() {
+                if !valid {
+                    normed[i * h..(i + 1) * h].fill(0.0);
+                }
+            }
+        }
         let mut bcx = vec![0.0f32; t * 3 * h];
-        linear(&normed, &conv.in_proj, t, h, 3 * h, &mut bcx);
+        conv.in_proj.apply(&normed, t, &mut bcx);
         // Split B, C, x along the last axis of size 3H: [T, 3H] = concat_last(B, C, x)
         let mut gate_b = vec![0.0f32; t * h];
         let mut gate_c = vec![0.0f32; t * h];
@@ -375,7 +442,7 @@ impl Lfm2Model {
         let mut y = vec![0.0f32; t * h];
         mul(&gate_c, &conv_out, &mut y);
         let mut projected = vec![0.0f32; t * h];
-        linear(&y, &conv.out_proj, t, h, h, &mut projected);
+        conv.out_proj.apply(&y, t, &mut projected);
         // residual: hidden = hidden + conv(norm(hidden))
         add_inplace(hidden, &projected);
     }
@@ -390,7 +457,7 @@ impl Lfm2Model {
             &mut normed,
         );
         let mut bcx = vec![0.0f32; 3 * h];
-        linear(&normed, &conv.in_proj, 1, h, 3 * h, &mut bcx);
+        conv.in_proj.apply(&normed, 1, &mut bcx);
         let (b, rest) = bcx.split_at(h);
         let (c, x) = rest.split_at(h);
         let mut u = vec![0.0f32; h];
@@ -400,7 +467,7 @@ impl Lfm2Model {
         let mut y = vec![0.0f32; h];
         mul(c, &conv_out, &mut y);
         let mut projected = vec![0.0f32; h];
-        linear(&y, &conv.out_proj, 1, h, h, &mut projected);
+        conv.out_proj.apply(&y, 1, &mut projected);
         add_inplace(hidden, &projected);
     }
 
@@ -411,6 +478,7 @@ impl Lfm2Model {
         t: usize,
         start_pos: usize,
         kv_cap: usize,
+        key_valid: &[bool],
     ) -> (Vec<f32>, Vec<f32>) {
         let h = self.hidden();
         let n_q = self.config.num_attention_heads;
@@ -427,9 +495,9 @@ impl Lfm2Model {
         let mut q = vec![0.0f32; t * n_q * d];
         let mut k = vec![0.0f32; t * n_kv * d];
         let mut v = vec![0.0f32; t * n_kv * d];
-        linear(&normed, &attn.q_proj, t, h, n_q * d, &mut q);
-        linear(&normed, &attn.k_proj, t, h, n_kv * d, &mut k);
-        linear(&normed, &attn.v_proj, t, h, n_kv * d, &mut v);
+        attn.q_proj.apply(&normed, t, &mut q);
+        attn.k_proj.apply(&normed, t, &mut k);
+        attn.v_proj.apply(&normed, t, &mut v);
         // q/k RMSNorm over head_dim
         rms_norm_heads(&mut q, &attn.q_norm.weight, self.config.norm_eps, n_q, t, d);
         rms_norm_heads(
@@ -452,10 +520,21 @@ impl Lfm2Model {
         apply_rope_in_place(&mut q_htd, &cos, &sin, n_q, t, d);
         apply_rope_in_place(&mut k_htd, &cos, &sin, n_kv, t, d);
 
-        let attn_out = attention_forward(&q_htd, &k_htd, &v_htd, n_q, n_kv, t, t, d, true);
+        let attn_out = attention_forward(
+            &q_htd,
+            &k_htd,
+            &v_htd,
+            n_q,
+            n_kv,
+            t,
+            t,
+            d,
+            true,
+            Some(key_valid),
+        );
         let flat = transpose_heads_out(&attn_out, n_q, t, d);
         let mut projected = vec![0.0f32; t * h];
-        linear(&flat, &attn.out_proj, t, n_q * d, h, &mut projected);
+        attn.out_proj.apply(&flat, t, &mut projected);
         add_inplace(hidden, &projected);
 
         // Store K/V at capacity `kv_cap` along time: layout [n_kv, cap, d], first t filled.
@@ -472,6 +551,7 @@ impl Lfm2Model {
         (k_store, v_store)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attn_decode(
         &self,
         attn: &AttnBlock,
@@ -480,6 +560,7 @@ impl Lfm2Model {
         k_cache: &mut [f32],
         v_cache: &mut [f32],
         kv_cap: usize,
+        key_valid: &[bool],
     ) {
         let h = self.hidden();
         let n_q = self.config.num_attention_heads;
@@ -498,9 +579,9 @@ impl Lfm2Model {
         let mut q = vec![0.0f32; n_q * d];
         let mut k = vec![0.0f32; n_kv * d];
         let mut v = vec![0.0f32; n_kv * d];
-        linear(&normed, &attn.q_proj, 1, h, n_q * d, &mut q);
-        linear(&normed, &attn.k_proj, 1, h, n_kv * d, &mut k);
-        linear(&normed, &attn.v_proj, 1, h, n_kv * d, &mut v);
+        attn.q_proj.apply(&normed, 1, &mut q);
+        attn.k_proj.apply(&normed, 1, &mut k);
+        attn.v_proj.apply(&normed, 1, &mut v);
         rms_norm_heads(&mut q, &attn.q_norm.weight, self.config.norm_eps, n_q, 1, d);
         rms_norm_heads(
             &mut k,
@@ -536,9 +617,20 @@ impl Lfm2Model {
                 v_full[dst..dst + d].copy_from_slice(&v_cache[src..src + d]);
             }
         }
-        let attn_out = attention_forward(&q, &k_full, &v_full, n_q, n_kv, 1, kv_len, d, false);
+        let attn_out = attention_forward(
+            &q,
+            &k_full,
+            &v_full,
+            n_q,
+            n_kv,
+            1,
+            kv_len,
+            d,
+            false,
+            Some(key_valid),
+        );
         let mut projected = vec![0.0f32; h];
-        linear(&attn_out, &attn.out_proj, 1, n_q * d, h, &mut projected);
+        attn.out_proj.apply(&attn_out, 1, &mut projected);
         add_inplace(hidden, &projected);
     }
 
@@ -554,15 +646,14 @@ impl Lfm2Model {
         );
         let mut g = vec![0.0f32; t * inter];
         let mut u = vec![0.0f32; t * inter];
-        linear(&normed, &ffn.w1, t, h, inter, &mut g);
-        linear(&normed, &ffn.w3, t, h, inter, &mut u);
+        apply_pair(&ffn.w1, &ffn.w3, &normed, t, &mut g, &mut u);
         silu_inplace(&mut g);
         for (a, b) in g.iter_mut().zip(u.iter()) {
             *a *= *b;
         }
-        let mut down = vec![0.0f32; t * h];
-        linear(&g, &ffn.w2, t, inter, h, &mut down);
-        add_inplace(hidden, &down);
+        // Down-projection is added in f64 so a large residual (chat_basic L09)
+        // does not pick up an extra f32 rounding step.
+        ffn.w2.apply_add(&g, t, hidden);
     }
 }
 
@@ -571,6 +662,21 @@ fn named<'a>(
     name: &str,
 ) -> Result<&'a TensorF32, LoadError> {
     get_tensor(tensors, name)
+}
+
+fn linear_named(
+    tensors: &HashMap<String, TensorF32>,
+    name: &str,
+    format: WeightFormat,
+) -> Result<Linear, LoadError> {
+    let t = named(tensors, name)?;
+    if t.shape.len() != 2 {
+        return Err(LoadError::Message(format!(
+            "{name}: expected a 2-D weight, got {:?}",
+            t.shape
+        )));
+    }
+    Linear::from_f32(t.data.clone(), t.shape[0], t.shape[1], format)
 }
 
 fn rms(t: &TensorF32, dim: usize) -> Result<Rms, LoadError> {
@@ -649,6 +755,7 @@ fn attention_forward(
     kv_len: usize,
     dim: usize,
     causal: bool,
+    key_valid: Option<&[bool]>,
 ) -> Vec<f32> {
     let scale = (dim as f32).sqrt().recip();
     let n_rep = n_q / n_kv;
@@ -659,7 +766,7 @@ fn attention_forward(
         for t in 0..q_len {
             let qv = &q[(qh * q_len + t) * dim..(qh * q_len + t) * dim + dim];
             for s in 0..kv_len {
-                if causal && s > t {
+                if (causal && s > t) || key_valid.is_some_and(|m| !m[s]) {
                     scores[t * kv_len + s] = f32::NEG_INFINITY;
                     continue;
                 }

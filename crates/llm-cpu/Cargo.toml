@@ -8,4 +8,5 @@ description = "CPU backend and SIMD kernels for llmhost."
 
 [dependencies]
 llm-core.workspace = true
+llm-quant.workspace = true
 rayon.workspace = true

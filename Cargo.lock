@@ -351,6 +351,7 @@ name = "llm-cpu"
 version = "0.1.0"
 dependencies = [
  "llm-core",
+ "llm-quant",
  "rayon",
 ]
 
@@ -388,6 +389,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "llmhost-bench"
+version = "0.1.0"
+dependencies = [
+ "llm-cpu",
+ "llm-engine",
+ "serde_json",
 ]
 
 [[package]]

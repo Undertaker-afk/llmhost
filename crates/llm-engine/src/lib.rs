@@ -14,6 +14,7 @@ mod load;
 mod npy;
 mod schedule;
 mod tree;
+mod weights;
 
 pub use batch::{Engine, EngineError, ForwardBatch, ForwardOutput, SeqInput, SeqLogits};
 pub use cache::{ConvSnapshot, ConvState, PagedKv, KV_BLOCK_TOKENS};

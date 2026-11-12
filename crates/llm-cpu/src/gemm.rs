@@ -65,6 +65,20 @@ pub fn linear(x: &[f32], w: &[f32], tokens: usize, d_in: usize, d_out: usize, ou
     gemm_nt(x, w, out, tokens, d_out, d_in);
 }
 
+/// `dst[t, out] += X[t, in] @ W[out, in]^T`, adding in f64 then writing f32.
+/// Used for the FFN down-projection so a large residual does not pick up an
+/// extra rounding step in the residual add.
+pub fn linear_add(x: &[f32], w: &[f32], tokens: usize, d_in: usize, d_out: usize, dst: &mut [f32]) {
+    assert_eq!(x.len(), tokens * d_in);
+    assert_eq!(w.len(), d_out * d_in);
+    assert_eq!(dst.len(), tokens * d_out);
+    let mut tmp = vec![0.0f32; tokens * d_out];
+    gemm_nt(x, w, &mut tmp, tokens, d_out, d_in);
+    for (d, &s) in dst.iter_mut().zip(tmp.iter()) {
+        *d = (f64::from(*d) + f64::from(s)) as f32;
+    }
+}
+
 fn is_avx2() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -133,16 +147,6 @@ unsafe fn dot_avx2_f64(a: &[f32], b: &[f32]) -> f32 {
         sum += f64::from(a[i]) * f64::from(b[i]);
     }
     sum as f32
-}
-
-/// Run `f` on a rayon pool with exactly `threads` workers.
-pub fn with_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
-    let n = threads.max(1);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .build()
-        .expect("rayon thread pool");
-    pool.install(f)
 }
 
 #[cfg(test)]

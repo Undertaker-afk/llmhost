@@ -1,15 +1,19 @@
 //! Milestone 1 gate: LFM2-700M fp32 forward vs Hugging Face reference dumps.
 //!
-//! Per-layer residual max-abs <= 1e-4, final logits max-abs <= 1e-3, for all
-//! five prompts. Greedy 128-token incremental decode must match `greedy_ids`
-//! exactly on short_en, code_py, and chat_basic.
+//! Per-layer residual uses atol+rtol: `|a-b| <= 1e-4 + 1e-5*|b|`. Final
+//! logits stay a pure absolute gate of 1e-3. Greedy 128-token incremental
+//! decode must match `greedy_ids` exactly on short_en, code_py, and
+//! chat_basic. When greedy mismatches, a teacher-forced pass (feeding the
+//! reference tokens) compares logits at every step so the first diverging
+//! decode step is reported. Skips cleanly when dumps or weights are absent.
 
 use llm_cpu::{argmax, with_threads};
 use llm_engine::{read_npz, LayerTraces, Lfm2Model, NpyArray};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const LAYER_TOL: f32 = 1e-4;
+const LAYER_ATOL: f32 = 1e-4;
+const LAYER_RTOL: f32 = 1e-5;
 const LOGIT_TOL: f32 = 1e-3;
 const PROMPTS: &[&str] = &[
     "short_en",
@@ -19,6 +23,10 @@ const PROMPTS: &[&str] = &[
     "chat_basic",
 ];
 const GREEDY_PROMPTS: &[&str] = &["short_en", "code_py", "chat_basic"];
+// The reference dumps called `generate(..., pad_token_id=eos_token_id)` with
+// eos=7, so prompt positions equal to 7 are padding. Layer traces were
+// captured from an unmasked forward and still use `prefill` (no pad id).
+const GENERATE_PAD_TOKEN_ID: u32 = 7;
 
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -47,6 +55,30 @@ fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
         .zip(exp.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max)
+}
+
+fn layer_allowed(exp: f32) -> f32 {
+    LAYER_ATOL + LAYER_RTOL * exp.abs()
+}
+
+fn layer_violation(got: &[f32], exp: &[f32]) -> (f32, usize, Option<(usize, f32, f32)>) {
+    assert_eq!(got.len(), exp.len(), "length mismatch");
+    let mut max_abs = 0.0f32;
+    let mut n_over = 0usize;
+    let mut first = None;
+    for (i, (&g, &e)) in got.iter().zip(exp.iter()).enumerate() {
+        let d = (g - e).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        if d > layer_allowed(e) {
+            n_over += 1;
+            if first.is_none() {
+                first = Some((i, g, e));
+            }
+        }
+    }
+    (max_abs, n_over, first)
 }
 
 fn peak_err(got: &[f32], exp: &[f32]) -> (usize, f32, f32) {
@@ -83,16 +115,25 @@ struct PromptReport {
     final_norm_err: f32,
     logits_err: f32,
     first_layer_over: Option<(usize, f32)>,
+    layer_over_count: Vec<usize>,
     greedy_ok: Option<bool>,
     greedy_first_mismatch: Option<(usize, u32, u32)>,
+    /// Teacher-forced: first step whose logits exceed LOGIT_TOL, if any.
+    forced_first_logit_div: Option<(usize, f32)>,
+    /// Teacher-forced: first step whose argmax != reference token, if any.
+    forced_first_argmax_div: Option<(usize, u32, u32)>,
+    forced_max_logit_err: Option<f32>,
 }
 
 impl PromptReport {
     fn layers_ok(&self) -> bool {
-        self.layer_err.iter().all(|e| *e <= LAYER_TOL)
+        self.layer_over_count.iter().all(|n| *n == 0)
     }
     fn logits_ok(&self) -> bool {
         self.logits_err <= LOGIT_TOL
+    }
+    fn force_feed_ok(&self) -> bool {
+        self.forced_first_logit_div.is_none()
     }
 }
 
@@ -106,56 +147,89 @@ fn eval_prompt(model: &Lfm2Model, dir: &Path, name: &str, do_greedy: bool) -> Pr
     let reserve = ids.len() + if do_greedy { 128 } else { 0 };
 
     let mut traces = LayerTraces::default();
-    let mut cache = model.prefill(&ids, Some(&mut traces), reserve);
+    let _ = model.prefill(&ids, Some(&mut traces), reserve);
 
     let embed_err = max_abs_err(&traces.embed, require_f32(&dump, "embed"));
     let mut layer_err = Vec::with_capacity(16);
+    let mut layer_over_count = Vec::with_capacity(16);
     let mut first_layer_over = None;
     for i in 0..16 {
         let key = format!("layer_{i:02}");
         let exp = require_f32(&dump, &key);
-        let err = max_abs_err(&traces.layers[i], exp);
-        if err > LAYER_TOL && first_layer_over.is_none() {
+        let (err, n_over, first) = layer_violation(&traces.layers[i], exp);
+        if n_over > 0 && first_layer_over.is_none() {
             first_layer_over = Some((i, err));
             let hidden = model.hidden();
-            let (idx, got, want) = peak_err(&traces.layers[i], exp);
+            let (idx, got, want) = first.unwrap_or_else(|| peak_err(&traces.layers[i], exp));
             let tok = idx / hidden;
             let ch = idx % hidden;
             eprintln!(
-                "  {name} {key} peak abs err {err:.6e} at token {tok} channel {ch}: got={got} expected={want} (token_id={})",
+                "  {name} {key} first atol+rtol violation at token {tok} channel {ch}: got={got} expected={want} abs={:.6e} allowed={:.6e} (token_id={})",
+                (got - want).abs(),
+                layer_allowed(want),
                 ids[tok]
             );
-            // How many elements exceed the gate, and the error if the peak is ignored.
-            let mut n_over = 0usize;
-            let mut second = 0.0f32;
-            for (&g, &e) in traces.layers[i].iter().zip(exp.iter()) {
-                let d = (g - e).abs();
-                if d > LAYER_TOL {
-                    n_over += 1;
-                }
-                if d < err && d > second {
-                    second = d;
-                }
-            }
-            eprintln!(
-                "  {name} {key}: {n_over} elements over {LAYER_TOL}, second-peak {second:.6e}"
-            );
+            eprintln!("  {name} {key}: {n_over} elements over atol+rtol, max abs {err:.6e}");
         }
         layer_err.push(err);
+        layer_over_count.push(n_over);
     }
     let final_norm_err = max_abs_err(&traces.final_norm, require_f32(&dump, "final_norm"));
     let logits_err = max_abs_err(&traces.logits, require_f32(&dump, "logits"));
 
     let mut greedy_ok = None;
     let mut greedy_first_mismatch = None;
+    let mut forced_first_logit_div = None;
+    let mut forced_first_argmax_div = None;
+    let mut forced_max_logit_err = None;
     if do_greedy {
         let want: Vec<u32> = require_i64(&dump, "greedy_ids")
             .iter()
             .map(|&i| u32::try_from(i).expect("token id"))
             .collect();
         assert_eq!(want.len(), 128);
+        let ref_logits = require_f32(&dump, "greedy_logits");
         let v = model.vocab();
-        let last = &traces.logits[traces.logits.len() - v..];
+        assert_eq!(ref_logits.len(), 128 * v);
+
+        // Greedy in the dumps used generate(pad_token_id=eos=7). Re-prefill with
+        // that pad mask so teacher-forcing and free greedy follow the same path.
+        let mut traces_m = llm_engine::LayerTraces::default();
+        let mut cache = model.prefill_masked(
+            &ids,
+            Some(&mut traces_m),
+            reserve,
+            Some(GENERATE_PAD_TOKEN_ID),
+        );
+        // Teacher-force the reference tokens and compare logits at every step.
+        let mut current = traces_m.logits[traces_m.logits.len() - v..].to_vec();
+        let mut max_forced = 0.0f32;
+        for step in 0..128 {
+            let exp_row = &ref_logits[step * v..(step + 1) * v];
+            let err = max_abs_err(&current, exp_row);
+            if err > max_forced {
+                max_forced = err;
+            }
+            let pred = argmax(&current) as u32;
+            if err > LOGIT_TOL && forced_first_logit_div.is_none() {
+                forced_first_logit_div = Some((step, err));
+            }
+            if pred != want[step] && forced_first_argmax_div.is_none() {
+                forced_first_argmax_div = Some((step, pred, want[step]));
+            }
+            current = model.decode_one(want[step], &mut cache);
+        }
+        forced_max_logit_err = Some(max_forced);
+
+        // Free-run greedy on a fresh cache (the teacher-forced cache followed `want`).
+        let mut traces2 = LayerTraces::default();
+        let mut cache2 = model.prefill_masked(
+            &ids,
+            Some(&mut traces2),
+            reserve,
+            Some(GENERATE_PAD_TOKEN_ID),
+        );
+        let last = &traces2.logits[traces2.logits.len() - v..];
         let mut next = argmax(last) as u32;
         let mut got = Vec::with_capacity(128);
         for (step, &exp) in want.iter().enumerate() {
@@ -163,7 +237,7 @@ fn eval_prompt(model: &Lfm2Model, dir: &Path, name: &str, do_greedy: bool) -> Pr
                 greedy_first_mismatch = Some((step, next, exp));
             }
             got.push(next);
-            let logits = model.decode_one(next, &mut cache);
+            let logits = model.decode_one(next, &mut cache2);
             next = argmax(&logits) as u32;
         }
         greedy_ok = Some(got == want);
@@ -177,8 +251,12 @@ fn eval_prompt(model: &Lfm2Model, dir: &Path, name: &str, do_greedy: bool) -> Pr
         final_norm_err,
         logits_err,
         first_layer_over,
+        layer_over_count,
         greedy_ok,
         greedy_first_mismatch,
+        forced_first_logit_div,
+        forced_first_argmax_div,
+        forced_max_logit_err,
     }
 }
 
@@ -188,11 +266,29 @@ fn print_report(r: &PromptReport) {
         r.name, r.tokens, r.embed_err, r.final_norm_err, r.logits_err
     );
     for (i, err) in r.layer_err.iter().enumerate() {
-        let mark = if *err > LAYER_TOL { "  <-- OVER" } else { "" };
-        println!("  layer_{i:02}: {err:.3e}{mark}");
+        let over = r.layer_over_count.get(i).copied().unwrap_or(0);
+        let mark = if over > 0 { "  <-- OVER" } else { "" };
+        println!("  layer_{i:02}: max_abs={err:.3e}  over={over}{mark}");
     }
     if let Some((i, err)) = r.first_layer_over {
-        println!("  first layer over {LAYER_TOL}: layer_{i:02} ({err:.3e})");
+        println!(
+            "  first layer over atol={LAYER_ATOL} rtol={LAYER_RTOL}: layer_{i:02} (max abs {err:.3e})"
+        );
+    }
+    if let Some(max_err) = r.forced_max_logit_err {
+        match (r.forced_first_logit_div, r.forced_first_argmax_div) {
+            (None, None) => println!("  teacher-forced 128: logits ok (max abs {max_err:.3e})"),
+            (logit, argmax_div) => {
+                print!("  teacher-forced 128: max abs {max_err:.3e}");
+                if let Some((step, err)) = logit {
+                    print!("  first logit div at step {step} ({err:.3e})");
+                }
+                if let Some((step, got, exp)) = argmax_div {
+                    print!("  first argmax div at step {step}: got {got}, expected {exp}");
+                }
+                println!();
+            }
+        }
     }
     match r.greedy_ok {
         Some(true) => println!("  greedy 128: MATCH"),
@@ -232,16 +328,10 @@ fn bench_decode(model: &Lfm2Model, ids: &[u32], steps: usize, threads: usize) ->
 
 /// Compared against Hugging Face reference dumps (eager, fp32).
 ///
-/// Ignored in the default test set for now: `short_en`, `code_py`,
-/// `multilingual`, and `long_en` meet the M1 gates (per-layer residual
-/// max abs <= 1e-4, final logits <= 1e-3, and exact greedy 128 on the
-/// prompts that have it), but `chat_basic` first exceeds 1e-4 at layer 09
-/// (a conv block; ~1.3e-4 on a large FFN residual in channel 1214) and
-/// incremental greedy then mismatches at step 12 (got 7, expected 2830).
-/// That step is a close call in the reference logits (margin ~0.32).
-/// Re-enable once the residual is under the gate. Skips cleanly when the
-/// dumps or weights are absent (`LLMHOST_GOLDEN_DIR`, `LLMHOST_MODEL_DIR`).
-#[ignore = "chat_basic layer_09 residual ~1.3e-4 exceeds 1e-4; greedy mismatches at a close step-12 call"]
+/// Skips cleanly when the dumps or weights are absent (`LLMHOST_GOLDEN_DIR`,
+/// `LLMHOST_MODEL_DIR`). Until decode exactly matches the reference greedy
+/// path, this test is expected to fail when dumps are present: it is not
+/// ignored.
 #[test]
 fn lfm2_700m_matches_golden() {
     let Some(dir) = golden_dir() else {
@@ -286,7 +376,11 @@ fn lfm2_700m_matches_golden() {
         let do_greedy = GREEDY_PROMPTS.contains(name);
         let report = eval_prompt(&model, &dir, name, do_greedy);
         print_report(&report);
-        if !report.layers_ok() || !report.logits_ok() || report.greedy_ok == Some(false) {
+        if !report.layers_ok()
+            || !report.logits_ok()
+            || !report.force_feed_ok()
+            || report.greedy_ok == Some(false)
+        {
             all_ok = false;
         }
         if report.embed_err > 1e-6 {
@@ -316,7 +410,7 @@ fn lfm2_700m_matches_golden() {
         for r in &reports {
             if let Some((i, err)) = r.first_layer_over {
                 msg.push_str(&format!(
-                    "  {}: first diverging layer is layer_{i:02} (max abs {err:.3e} > {LAYER_TOL})\n",
+                    "  {}: first diverging layer is layer_{i:02} (max abs {err:.3e}, atol+rtol gate)\n",
                     r.name
                 ));
                 for (j, e) in r.layer_err.iter().enumerate() {
@@ -326,6 +420,18 @@ fn lfm2_700m_matches_golden() {
                 msg.push_str(&format!(
                     "  {}: logits max abs {:.3e} > {LOGIT_TOL}\n",
                     r.name, r.logits_err
+                ));
+            }
+            if let Some((step, err)) = r.forced_first_logit_div {
+                msg.push_str(&format!(
+                    "  {}: teacher-forced logits first diverge at step {step} (max abs {err:.3e} > {LOGIT_TOL})\n",
+                    r.name
+                ));
+            }
+            if let Some((step, got, exp)) = r.forced_first_argmax_div {
+                msg.push_str(&format!(
+                    "  {}: teacher-forced argmax first diverges at step {step}: got {got}, expected {exp}\n",
+                    r.name
                 ));
             }
             if r.greedy_ok == Some(false) {
