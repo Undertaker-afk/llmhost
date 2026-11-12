@@ -122,7 +122,9 @@ def main():
                 h.remove()
             with torch.no_grad():
                 g = model.generate(
-                    ids, max_new_tokens=args.greedy, do_sample=False, output_logits=True,
+                    # Explicit all-ones mask: otherwise generate() infers padding from
+                    # pad_token_id == eos and masks real EOS tokens inside chat prompts.
+                    ids, attention_mask=torch.ones_like(ids), max_new_tokens=args.greedy, do_sample=False, output_logits=True,
                     return_dict_in_generate=True, eos_token_id=None, pad_token_id=tok.eos_token_id,
                 )
             rec["greedy_ids"] = g.sequences[0, ids.shape[1]:].numpy().astype(np.int64)

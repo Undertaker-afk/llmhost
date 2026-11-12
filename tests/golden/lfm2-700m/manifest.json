@@ -78,7 +78,7 @@
         "layer_15",
         "logits"
       ],
-      "seconds": 8.66
+      "seconds": 10.52
     },
     "code_py": {
       "file": "code_py.npz",
@@ -109,7 +109,7 @@
         "layer_15",
         "logits"
       ],
-      "seconds": 8.76
+      "seconds": 10.49
     },
     "multilingual": {
       "file": "multilingual.npz",
@@ -138,7 +138,7 @@
         "layer_15",
         "logits"
       ],
-      "seconds": 0.2
+      "seconds": 0.22
     },
     "long_en": {
       "file": "long_en.npz",
@@ -167,11 +167,11 @@
         "layer_15",
         "logits"
       ],
-      "seconds": 1.15
+      "seconds": 1.34
     },
     "chat_basic": {
       "file": "chat_basic.npz",
-      "sha256": "b3f99369161408f663988af56035b723847ce49ffb36475b264bf5268d7b56dc",
+      "sha256": "a23cab9c872e403e8728eaa9bc9c2c3b591d830f19c63825bae74ae2ee0ea413",
       "tokens": 25,
       "greedy_tokens": 128,
       "keys": [
@@ -198,7 +198,7 @@
         "layer_15",
         "logits"
       ],
-      "seconds": 8.71
+      "seconds": 10.81
     }
   },
   "layer_capture": "residual stream after each decoder layer (forward hook on layers[i])"
